@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # ShellRec
 
 Minimal screen recorder for Arch Linux with X11 and Wayland support. Uses FFmpeg (X11) or wf-recorder (Wayland) with optimized presets.
@@ -216,3 +217,7 @@ Created by [@vifirsanova](https://github.com/vifirsanova) (missvector)
 Issues and feedback welcome on GitHub.
 
 **Version:** 2.1 (X11 and Wayland support)
+=======
+# shellrec
+A minimalist FFmpeg-based screen recorder for Arch Linux
+>>>>>>> origin/main
