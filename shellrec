@@ -1,0 +1,458 @@
+#!/bin/bash
+# ShellRec - Arch Minimal Screen Recorder based on FFmpeg
+# Version 2.1 - Supports X11 and Wayland with auto-dependency setup
+
+# Defaults
+VERSION="2.1"
+DEFAULT_PRESET="web"
+DEFAULT_KEYS=false
+OUTPUT_DIR="${HOME}/Videos/shellrec"
+LOG_FILE="/tmp/shellrec.log"
+DATETIME=$(date +%Y%m%d_%H%M%S)
+CONFIG_DIR="${HOME}/.config/shellrec"
+FIRST_RUN_FILE="${CONFIG_DIR}/first_run"
+
+# Detect display server
+if [ -n "${WAYLAND_DISPLAY}" ]; then
+    DISPLAY_SERVER="wayland"
+else
+    DISPLAY_SERVER="x11"
+fi
+
+# Dependencies
+REQUIRED_DEPS_X11=("ffmpeg")
+RECOMMENDED_DEPS_X11=("slop" "xdotool" "screenkey")
+REQUIRED_DEPS_WAYLAND=("wf-recorder")
+RECOMMENDED_DEPS_WAYLAND=("slurp" "screenkey")
+
+# Presets
+declare -A PRESETS
+PRESETS[web]="libx264:aac:fast:28:mp4:-movflags +faststart -pix_fmt yuv420p"
+PRESETS[compressed]="libx264:aac:ultrafast:32:mp4:-profile:v baseline -level 3.0 -tune fastdecode"
+PRESETS[nvidia]="h264_nvenc:aac:p4:23:mp4:-rc vbr -cq 23 -b:v 0"
+PRESETS[uni]="libx264:aac:medium:23:mp4:-profile:v high -level 4.1"
+PRESETS[lossless]="libx264:aac:veryslow:0:mkv:-qp 0 -preset veryslow"
+
+# ====================
+# DEPENDENCY HANDLING
+# ====================
+
+check_critical_deps() {
+    # Check for critical dependencies that would prevent recording
+    local missing_critical=0
+    
+    if [ "$DISPLAY_SERVER" = "x11" ]; then
+        if ! command -v ffmpeg &> /dev/null; then
+            echo "ERROR: ffmpeg not installed!"
+            echo "Required for X11 screen recording"
+            missing_critical=1
+        fi
+    else
+        if ! command -v wf-recorder &> /dev/null; then
+            echo "ERROR: wf-recorder not installed!"
+            echo "Required for Wayland screen recording"
+            missing_critical=1
+        fi
+    fi
+    
+    if [ $missing_critical -eq 1 ]; then
+        echo ""
+        echo "Install missing dependencies with: shellrec -deps"
+        echo "Or manually:"
+        if [ "$DISPLAY_SERVER" = "x11" ]; then
+            echo "  sudo pacman -S ffmpeg"
+        else
+            echo "  sudo pacman -S wf-recorder"
+        fi
+        exit 1
+    fi
+}
+
+auto_install_deps() {
+    # Only run on first launch
+    if [ -f "$FIRST_RUN_FILE" ]; then
+        return 0
+    fi
+    
+    echo "First run detected. Checking dependencies..."
+    echo ""
+    
+    install_dependencies
+    local result=$?
+    
+    if [ $result -eq 0 ] || [ $result -eq 2 ]; then
+        mkdir -p "$CONFIG_DIR"
+        touch "$FIRST_RUN_FILE"
+        echo ""
+        echo "Setup complete. Ready to record!"
+        echo ""
+    fi
+    
+    return $result
+}
+
+install_dependencies() {
+    echo "Checking dependencies for ${DISPLAY_SERVER}..."
+    echo ""
+    
+    local to_install=()
+    
+    if [ "$DISPLAY_SERVER" = "x11" ]; then
+        deps=("${REQUIRED_DEPS_X11[@]}")
+        rec_deps=("${RECOMMENDED_DEPS_X11[@]}")
+    else
+        deps=("${REQUIRED_DEPS_WAYLAND[@]}")
+        rec_deps=("${RECOMMENDED_DEPS_WAYLAND[@]}")
+    fi
+    
+    # Check required dependencies
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            echo "  ✗ $dep (required)"
+            to_install+=("$dep")
+        else
+            echo "  ✓ $dep"
+        fi
+    done
+    
+    # Check recommended dependencies
+    for dep in "${rec_deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            echo "  ~ $dep (recommended)"
+            to_install+=("$dep")
+        else
+            echo "  ✓ $dep"
+        fi
+    done
+    
+    if [ ${#to_install[@]} -gt 0 ]; then
+        echo ""
+        echo "Missing packages: ${to_install[*]}"
+        echo ""
+        read -p "Install missing dependencies now? [Y/n]: " -n 1 -r
+        echo
+        
+        if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
+            if ! command -v pacman &> /dev/null; then
+                echo "Cannot install: pacman not found"
+                echo "Install manually: sudo pacman -S ${to_install[*]}"
+                return 1
+            fi
+            
+            echo "Installing: ${to_install[*]}"
+            echo ""
+            
+            if sudo pacman -S --needed --noconfirm "${to_install[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+                echo ""
+                echo "✓ Dependencies installed successfully"
+                return 0
+            else
+                echo ""
+                echo "✗ Installation failed"
+                echo "Check log: $LOG_FILE"
+                echo "Install manually: sudo pacman -S ${to_install[*]}"
+                return 1
+            fi
+        else
+            echo "Skipping dependency installation"
+            echo "Some features may not work"
+            return 2
+        fi
+    else
+        echo ""
+        echo "✓ All dependencies satisfied"
+        return 0
+    fi
+}
+
+# ====================
+# MAIN FUNCTIONS
+# ====================
+
+show_help() {
+    echo "ShellRec - Arch Minimal Screen Recorder"
+    echo "Version: ${VERSION}"
+    echo "Display server: ${DISPLAY_SERVER}"
+    echo ""
+    echo "Usage: shellrec [options]"
+    echo ""
+    echo "Options:"
+    echo "  -set PRESET     Preset: web, compressed, nvidia, uni, lossless"
+    echo "                  Default: web"
+    echo "  -key            Show keystrokes (screenkey)"
+    echo "                  Default: off"
+    echo "  -out NAME       Output filename (without extension)"
+    echo "                  Default: YYYYMMDD_HHMMSS_recording"
+    echo "  -res WxH        Resolution (1920x1080, 1280x720)"
+    echo "  -fps N          Frames per second (default: 30)"
+    echo "  -area           Select area with mouse"
+    echo "  -window         Record active window (X11 only)"
+    echo "  -fullscreen     Record entire screen (default)"
+    echo "  -dir PATH       Output directory"
+    echo "  -deps           Check/install dependencies"
+    echo "  -h, --help      Show this help"
+    echo "  -v, --version   Show version"
+    echo ""
+    echo "Examples:"
+    echo "  shellrec -set nvidia -key"
+    echo "  shellrec -set compressed -area -out bug_report"
+    echo "  shellrec -fps 60 -dir ~/Desktop"
+    echo ""
+    echo "Available presets:"
+    echo "  web         - For web, YouTube (balanced)"
+    echo "  compressed  - For low-end devices"
+    echo "  nvidia     - NVidia hardware encoding"
+    echo "  uni        - Universal (recommended)"
+    echo "  lossless   - Maximum quality, large files"
+}
+
+setup_recording() {
+    echo "Setting up recording (${DISPLAY_SERVER})..."
+    
+    # Default filename
+    if [ -z "$OUTPUT_NAME" ]; then
+        OUTPUT_NAME="${DATETIME}_recording"
+    fi
+    
+    # Full output path
+    local format=$(echo ${PRESETS[$PRESET]} | cut -d: -f5)
+    OUTPUT_FILE="$OUTPUT_DIR/${OUTPUT_NAME}.${format}"
+    
+    mkdir -p "$OUTPUT_DIR"
+    echo "Output: $OUTPUT_FILE"
+    
+    # X11 specific setup
+    if [ "$DISPLAY_SERVER" = "x11" ]; then
+        if [ -z "$RESOLUTION" ]; then
+            RESOLUTION=$(xdpyinfo | grep dimensions | awk '{print $2}' 2>/dev/null || echo "1920x1080")
+        fi
+        
+        if [ "$RECORD_WINDOW" = true ]; then
+            if command -v xdotool &> /dev/null; then
+                WINDOW_ID=$(xdotool getactivewindow)
+                GEOMETRY=$(xdotool getwindowgeometry $WINDOW_ID 2>/dev/null | grep Geometry | awk '{print $2}')
+                
+                if [ -n "$GEOMETRY" ]; then
+                    POSITION=$(xdotool getwindowgeometry $WINDOW_ID 2>/dev/null | grep Position | awk '{print $2}' | tr ',' ' ')
+                    WIDTH=$(echo $GEOMETRY | cut -d'x' -f1)
+                    HEIGHT=$(echo $GEOMETRY | cut -d'x' -f2)
+                    OFFSET_X=$(echo $POSITION | awk '{print $1}')
+                    OFFSET_Y=$(echo $POSITION | awk '{print $2}')
+                    SCREEN_SIZE="${WIDTH}x${HEIGHT}"
+                else
+                    SCREEN_SIZE="$RESOLUTION"
+                    OFFSET_X=0
+                    OFFSET_Y=0
+                fi
+            else
+                SCREEN_SIZE="$RESOLUTION"
+                OFFSET_X=0
+                OFFSET_Y=0
+            fi
+        elif [ "$RECORD_AREA" = true ]; then
+            if command -v slop &> /dev/null; then
+                AREA=$(slop -f "%x %y %w %h" 2>/dev/null)
+                
+                if [ -n "$AREA" ]; then
+                    OFFSET_X=$(echo $AREA | awk '{print $1}')
+                    OFFSET_Y=$(echo $AREA | awk '{print $2}')
+                    WIDTH=$(echo $AREA | awk '{print $3}')
+                    HEIGHT=$(echo $AREA | awk '{print $4}')
+                    SCREEN_SIZE="${WIDTH}x${HEIGHT}"
+                else
+                    SCREEN_SIZE="$RESOLUTION"
+                    OFFSET_X=0
+                    OFFSET_Y=0
+                fi
+            else
+                SCREEN_SIZE="$RESOLUTION"
+                OFFSET_X=0
+                OFFSET_Y=0
+            fi
+        else
+            SCREEN_SIZE="$RESOLUTION"
+            OFFSET_X=0
+            OFFSET_Y=0
+        fi
+    fi
+    
+    # Wayland area selection
+    if [ "$DISPLAY_SERVER" = "wayland" ] && [ "$RECORD_AREA" = true ]; then
+        if command -v slurp &> /dev/null; then
+            AREA=$(slurp 2>/dev/null)
+            if [ -n "$AREA" ]; then
+                SLURP_AREA="-g $AREA"
+            fi
+        fi
+    fi
+    
+    FPS=${FPS:-30}
+    echo "FPS: $FPS | Preset: $PRESET"
+}
+
+start_screenkey() {
+    if [ "$SHOW_KEYS" = true ]; then
+        if ! command -v screenkey &> /dev/null; then
+            return
+        fi
+        
+        screenkey --font-size medium --opacity 0.7 2>/dev/null &
+        SCREENKEY_PID=$!
+        sleep 1
+    fi
+}
+
+start_recording_x11() {
+    IFS=':' read -r VIDEO_CODEC AUDIO_CODEC QUALITY CRF FORMAT EXTRA_FLAGS <<< "${PRESETS[$PRESET]}"
+    
+    ffmpeg -y \
+        -f x11grab \
+        -video_size "$SCREEN_SIZE" \
+        -framerate "$FPS" \
+        -i ":0.0+$OFFSET_X,$OFFSET_Y" \
+        -f pulse \
+        -i default \
+        -c:v "$VIDEO_CODEC" \
+        -preset "$QUALITY" \
+        -crf "$CRF" \
+        -c:a "$AUDIO_CODEC" \
+        $EXTRA_FLAGS \
+        "$OUTPUT_FILE" 2>&1 | tee -a "$LOG_FILE"
+    
+    return ${PIPESTATUS[0]}
+}
+
+start_recording_wayland() {
+    local wf_recorder_cmd="wf-recorder"
+    
+    if [ "$RECORD_AREA" = true ] && [ -n "$SLURP_AREA" ]; then
+        wf_recorder_cmd="$wf_recorder_cmd $SLURP_AREA"
+    fi
+    
+    if [ -n "$FPS" ]; then
+        wf_recorder_cmd="$wf_recorder_cmd -f $FPS"
+    fi
+    
+    $wf_recorder_cmd -f "$OUTPUT_FILE" 2>&1 | tee -a "$LOG_FILE"
+    
+    return ${PIPESTATUS[0]}
+}
+
+cleanup() {
+    if [ -n "$SCREENKEY_PID" ] && kill -0 $SCREENKEY_PID 2>/dev/null; then
+        kill $SCREENKEY_PID 2>/dev/null
+    fi
+    
+    if [ -f "$OUTPUT_FILE" ] && [ $(wc -c < "$OUTPUT_FILE" 2>/dev/null || echo 0) -gt 10240 ]; then
+        echo "Recording saved: $OUTPUT_FILE"
+        local file_size=$(du -h "$OUTPUT_FILE" 2>/dev/null | cut -f1)
+        echo "Size: $file_size"
+        return 0
+    else
+        echo "Recording failed"
+        echo "Check log: $LOG_FILE"
+        return 1
+    fi
+}
+
+# ====================
+# MAIN EXECUTION
+# ====================
+
+# Parse arguments
+PRESET="$DEFAULT_PRESET"
+SHOW_KEYS="$DEFAULT_KEYS"
+RECORD_WINDOW=false
+RECORD_AREA=false
+FPS=""
+RESOLUTION=""
+OUTPUT_NAME=""
+OUTPUT_DIR="${HOME}/Videos/shellrec"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -set)
+            PRESET="$2"
+            shift 2
+            ;;
+        -key)
+            SHOW_KEYS=true
+            shift
+            ;;
+        -out)
+            OUTPUT_NAME="$2"
+            shift 2
+            ;;
+        -res)
+            RESOLUTION="$2"
+            shift 2
+            ;;
+        -fps)
+            FPS="$2"
+            shift 2
+            ;;
+        -area)
+            RECORD_AREA=true
+            shift
+            ;;
+        -window)
+            RECORD_WINDOW=true
+            shift
+            ;;
+        -fullscreen)
+            RECORD_AREA=false
+            RECORD_WINDOW=false
+            shift
+            ;;
+        -dir)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        -deps)
+            install_dependencies
+            exit $?
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -v|--version)
+            echo "shellrec v$VERSION"
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# Validate preset
+if [[ ! "${!PRESETS[@]}" =~ (^| )$PRESET($| ) ]]; then
+    echo "Unknown preset: $PRESET"
+    show_help
+    exit 1
+fi
+
+# Auto-install dependencies on first run (unless -deps or -help or -version)
+if [ "$1" != "-deps" ] && [ "$1" != "-h" ] && [ "$1" != "--help" ] && [ "$1" != "-v" ] && [ "$1" != "--version" ]; then
+    check_critical_deps
+    auto_install_deps
+fi
+
+# Main execution
+setup_recording
+start_screenkey
+
+trap 'cleanup; exit 0' INT TERM
+
+if [ "$DISPLAY_SERVER" = "x11" ]; then
+    start_recording_x11
+else
+    start_recording_wayland
+fi
+
+RECORD_EXIT=$?
+cleanup
+exit $RECORD_EXIT
